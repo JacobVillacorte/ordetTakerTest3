@@ -19,7 +19,7 @@ Sub Globals
 	Private lblBack As Label
 	Private lblTitle As Label
 	Private lblSubTitle As Label
-	Private bttnRefresh As Button
+	Private lblRefresh As Label
 	Private pnlBody As Panel
 	Private etSearch As EditText
 	Private lblStatus As Label
@@ -31,13 +31,19 @@ Sub Globals
 	Private lblConfirmVendor As Label
 	Private bttnCancel As Button
 	Private bttnProceed As Button
+	Private btnGoToQueue As Button
 	Private orderTakerRows As List
+	Private currentLoadJob As HttpJob
 	Private selectedUserId As Int = 0
 	Private selectedRowData As Map
 End Sub
 
 Sub Activity_Create(FirstTime As Boolean)
 	Activity.LoadLayout("SupervisorOrderTakerSelection")
+	If Main.LoggedInUserID <= 0 Then
+		Activity.Finish
+		Return
+	End If
 	If pnlConfirm.IsInitialized Then
 		If pnlConfirm.NumberOfViews >= 6 Then
 			bttnCancel = pnlConfirm.GetView(4)
@@ -58,9 +64,6 @@ Sub Activity_Create(FirstTime As Boolean)
 	If lblSubTitle.IsInitialized Then
 		lblSubTitle.Text = "Select the order taker you want to view"
 	End If
-	If bttnRefresh.IsInitialized Then
-		bttnRefresh.Text = "Reload"
-	End If
 	If lblConfirmTitle.IsInitialized Then
 		lblConfirmTitle.Text = "View this order taker?"
 	End If
@@ -68,6 +71,10 @@ Sub Activity_Create(FirstTime As Boolean)
 End Sub
 
 Sub Activity_Resume
+	If Main.LoggedInUserID <= 0 Then
+		Activity.Finish
+		Return
+	End If
 	If orderTakerRows.IsInitialized = False Or orderTakerRows.Size = 0 Then
 		LoadOrderTakers
 	Else
@@ -76,6 +83,14 @@ Sub Activity_Resume
 End Sub
 
 Sub Activity_Pause(UserClosed As Boolean)
+	If currentLoadJob <> Null Then
+		Try
+			If currentLoadJob.IsInitialized Then currentLoadJob.Release
+		Catch
+			Log(LastException.Message)
+		End Try
+		currentLoadJob = Null
+	End If
 End Sub
 
 Private Sub LoadOrderTakers
@@ -84,6 +99,7 @@ Private Sub LoadOrderTakers
 
 	Dim job As HttpJob
 	job.Initialize("load_order_takers", Me)
+	currentLoadJob = job
 	job.Download(Main.API_URL & "API/get_order_takers.php?convention_id=" & Main.LoggedInConventionID & "&limit=200")
 
 	Wait For (job) JobDone(job As HttpJob)
@@ -91,6 +107,7 @@ Private Sub LoadOrderTakers
 		lblStatus.Text = "Unable to load order takers."
 		ToastMessageShow("Unable to load order takers.", True)
 		job.Release
+		currentLoadJob = Null
 		Return
 	End If
 
@@ -106,6 +123,7 @@ Private Sub LoadOrderTakers
 			lblStatus.Text = message
 			ToastMessageShow(message, True)
 			job.Release
+			currentLoadJob = Null
 			Return
 		End If
 
@@ -123,6 +141,7 @@ Private Sub LoadOrderTakers
 	End Try
 
 	job.Release
+	currentLoadJob = Null
 End Sub
 
 Private Sub ApplySearchFilter
@@ -254,11 +273,17 @@ Private Sub etSearch_TextChanged (Old As String, New As String)
 	ApplySearchFilter
 End Sub
 
-Private Sub bttnRefresh_Click
+Private Sub lblRefresh_Click
 	LoadOrderTakers
 End Sub
 
+Private Sub btnGoToQueue_Click
+	StartActivity(SupervisorStockRequestQueue)
+	Activity.Finish
+End Sub
+
 Private Sub lblBack_Click
+	CallSub(Main, "ResetSessionForLogout")
 	StartActivity(Main)
 	Activity.Finish
 End Sub

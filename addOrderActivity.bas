@@ -81,6 +81,10 @@ End Sub
 
 Sub Activity_Create(FirstTime As Boolean)
 	Activity.LoadLayout("addOrderActivity")
+	If Main.LoggedInUserID <= 0 Then
+		Activity.Finish
+		Return
+	End If
 
 	If Main.VENDOR_ID <= 0 Or Main.LoggedInUserID <= 0 Then
 		ToastMessageShow("Session is invalid. Please login again.", True)
@@ -104,6 +108,10 @@ Sub Activity_Create(FirstTime As Boolean)
 End Sub
 
 Sub Activity_Resume
+	If Main.LoggedInUserID <= 0 Then
+		Activity.Finish
+		Return
+	End If
 	ApplyPendingCopyOrder
 End Sub
 
@@ -134,6 +142,19 @@ End Sub
 
 Private Sub LoadCopiedOrderIntoCart(sourceOrderID As Int)
 	Try
+		Dim rsOrder As ResultSet = Main.SQLProducts.ExecQuery2( _
+			"SELECT customer_id, customer_code, customer_name, customer_owner, customer_address FROM orders WHERE order_id = ?", _
+			Array As String(sourceOrderID))
+
+		If rsOrder.NextRow Then
+			Main.SELECTED_CUSTOMER_ID = rsOrder.GetInt("customer_id")
+			Main.SELECTED_CUSTOMER_CODE = rsOrder.GetString("customer_code")
+			Main.SELECTED_CUSTOMER_NAME = rsOrder.GetString("customer_name")
+			Main.SELECTED_CUSTOMER_OWNER = rsOrder.GetString("customer_owner")
+			Main.SELECTED_CUSTOMER_ADDRESS = rsOrder.GetString("customer_address")
+		End If
+		rsOrder.Close
+
 		Dim rsItems As ResultSet = Main.SQLProducts.ExecQuery2( _
 			"SELECT oi.product_id, oi.quantity, oi.price, i.item_name, i.item_code " & _
 			"FROM order_items oi " & _
@@ -769,12 +790,78 @@ Private Sub SaveOrderToLocalDatabase(FulfillmentStatus As String)
                 Array As Object(newOrderID, productID, quantity, unitPrice, FulfillmentStatus, paymentStatus, deliveryStatus))
 		Next
 
+		ApplyStockDeductionFromCart
+
 		Log("Order saved with transaction: " & transactionNumber)
 
 	Catch
 		Log("SaveOrderToLocalDatabase error: " & LastException.Message)
 		ToastMessageShow("Failed to save order. Please try again.", True)
 	End Try
+End Sub
+
+Private Sub ApplyStockDeductionFromCart
+	Try
+		Main.SQLProducts.ExecNonQuery("BEGIN TRANSACTION")
+
+		For Each cartItem As Map In CartItems
+			Dim productID As Int = cartItem.Get("product_id")
+			Dim quantity As Int = cartItem.Get("quantity")
+			Dim remainingStock As Int = GetRemainingStockForProduct(productID)
+			If remainingStock < 0 Then Continue
+
+			Main.SQLProducts.ExecNonQuery2( _
+				"UPDATE items SET used_stock = IFNULL(used_stock, 0) + ?, remaining_stock = CASE WHEN IFNULL(remaining_stock, 0) - ? < 0 THEN 0 ELSE IFNULL(remaining_stock, 0) - ? END WHERE item_id = ? AND (IFNULL(assigned_stock, 0) > 0 OR IFNULL(used_stock, 0) > 0 OR IFNULL(remaining_stock, 0) > 0)", _
+				Array As Object(quantity, quantity, quantity, productID))
+		Next
+
+		Main.SQLProducts.ExecNonQuery("COMMIT")
+	Catch
+		Try
+			Main.SQLProducts.ExecNonQuery("ROLLBACK")
+		Catch
+			Log(LastException.Message)
+		End Try
+		Log("ApplyStockDeductionFromCart error: " & LastException.Message)
+	End Try
+End Sub
+
+Private Sub GetCartQuantityForProduct(ProductID As Int) As Int
+	Dim totalQuantity As Int = 0
+	For Each cartItem As Map In CartItems
+		Dim existingProductID As Int = cartItem.Get("product_id")
+		If existingProductID = ProductID Then
+			totalQuantity = totalQuantity + cartItem.Get("quantity")
+		End If
+	Next
+	Return totalQuantity
+End Sub
+
+Private Sub GetRemainingStockForProduct(ProductID As Int) As Int
+	If Main.SQLProducts.IsInitialized = False Then Return -1
+
+	Dim rs As ResultSet
+	Try
+		rs = Main.SQLProducts.ExecQuery2( _
+			"SELECT IFNULL(assigned_stock, 0) AS assigned_stock, IFNULL(used_stock, 0) AS used_stock, IFNULL(remaining_stock, 0) AS remaining_stock FROM items WHERE item_id = ?", _
+			Array As String(ProductID))
+
+		If rs.NextRow Then
+			Dim assignedStock As Int = rs.GetInt("assigned_stock")
+			Dim usedStock As Int = rs.GetInt("used_stock")
+			Dim remainingStock As Int = rs.GetInt("remaining_stock")
+			rs.Close
+			If assignedStock <= 0 And usedStock <= 0 And remainingStock <= 0 Then Return -1
+			If remainingStock < 0 Then remainingStock = 0
+			Return remainingStock
+		End If
+		rs.Close
+	Catch
+		If rs.IsInitialized Then rs.Close
+		Log("GetRemainingStockForProduct error: " & LastException.Message)
+	End Try
+
+	Return -1
 End Sub
 
 Private Sub GetBookingFromFulfillmentStatus(FulfillmentStatus As String) As Int
@@ -808,6 +895,15 @@ Private Sub GetDeliveryStatusFromFulfillmentStatus(FulfillmentStatus As String) 
 End Sub
 
 Private Sub AddCartItemToList(ProductID As Int, ItemName As String, UnitPrice As Double, Quantity As Int, ItemCode As String)
+	Dim availableStock As Int = GetRemainingStockForProduct(ProductID)
+	If availableStock >= 0 Then
+		Dim currentQuantity As Int = GetCartQuantityForProduct(ProductID)
+		If currentQuantity + Quantity > availableStock Then
+			ToastMessageShow("Not enough stock left for " & ItemName, True)
+			Return
+		End If
+	End If
+
 	For Each cartItem As Map In CartItems
 		Dim existingProductID As Int = cartItem.Get("product_id")
 		If existingProductID = ProductID Then

@@ -55,7 +55,7 @@ Sub Globals
 	Private Const ORDERS_PAGE_SIZE As Int = 10
 
 	' Inventory tab
-	Private svInventory As ScrollView
+	Private clvInventory As CustomListView
 
 	' History tab
 	Private clvContentHistory As CustomListView
@@ -88,6 +88,10 @@ End Sub
 
 Sub Activity_Create(FirstTime As Boolean)
 	Activity.LoadLayout("OrderTakerDashboard")
+	If Main.LoggedInUserID <= 0 Then
+		Activity.Finish
+		Return
+	End If
 	SetupDashboardCards
 
 	Dim displayName As String = Main.LoggedInUser
@@ -105,8 +109,13 @@ Sub Activity_Create(FirstTime As Boolean)
 End Sub
 
 Sub Activity_Resume
+	If Main.LoggedInUserID <= 0 Then
+		Activity.Finish
+		Return
+	End If
 	LoadOrdersIntoList
 	UpdateDashboardStatusLabels
+	FetchAssignedStockForLocalCache
 	DrawWeeklySalesChart
 	DrawOrderStatusPieChart
 End Sub
@@ -196,6 +205,10 @@ Sub EnsureLocalSchema
 	AddColumnIfMissing("order_items", "fulfillment_status", "TEXT DEFAULT ''")
 	AddColumnIfMissing("order_items", "payment_status", "TEXT DEFAULT ''")
 	AddColumnIfMissing("order_items", "delivery_status", "TEXT DEFAULT ''")
+	' items table stock cache
+	AddColumnIfMissing("items", "assigned_stock", "INTEGER DEFAULT 0")
+	AddColumnIfMissing("items", "used_stock", "INTEGER DEFAULT 0")
+	AddColumnIfMissing("items", "remaining_stock", "INTEGER DEFAULT 0")
 End Sub
 
 Sub AddColumnIfMissing(TableName As String, ColumnName As String, ColumnDef As String)
@@ -284,7 +297,7 @@ End Sub
 
 Private Sub pnlInventory_Click
 	ShowPanel(pnlContentInventory)
-	LoadInventoryItemsIntoScrollView
+	FetchAssignedStockForLocalCache
 End Sub
 
 Private Sub pnlHistory_Click
@@ -295,14 +308,7 @@ Private Sub pnlHistory_Click
 End Sub
 
 Private Sub lbllogout_Click
-	Main.LoggedInUser = ""
-	Main.LoggedInUserID = 0
-	Main.LoggedInUserFullName = ""
-	Main.LoggedInGroupID = 0
-	Main.VENDOR_ID = 0
-	Main.LoggedInRequiresVendorSelection = False
-	Main.AssignedVendors.Initialize
-
+	CallSub(Main, "ResetSessionForLogout")
 	StartActivity(Main)
 	Activity.Finish
 End Sub
@@ -536,165 +542,285 @@ Private Sub clvContentOrders_ItemLongClick(Index As Int, Value As Object)
 End Sub
 
 Private Sub bttnCopyOrder_Click
-	Dim btn As Button = Sender
-	Dim sourceOrderID As Int = btn.Tag
-	If sourceOrderID <= 0 Then Return
-	CopyOrder(sourceOrderID)
+	Dim orderID As Int = GetOrderIdFromSender(Sender)
+	If orderID <= 0 Then Return
+
+	Main.COPY_ORDER_SOURCE_ID = orderID
+	ToastMessageShow("Copying order...", False)
+	StartActivity(addOrderActivity)
 End Sub
 
 Private Sub bttnDeleteOrder_Click
-	Dim btn As Button = Sender
-	Dim sourceOrderID As Int = btn.Tag
-	If sourceOrderID <= 0 Then Return
-	DeleteOrder(sourceOrderID)
-End Sub
+	Dim orderID As Int = GetOrderIdFromSender(Sender)
+	If orderID <= 0 Then Return
 
-Private Sub bttnOrdersPrev_Click
-	If currentOrdersPage <= 1 Then Return
-	currentOrdersPage = currentOrdersPage - 1
-	LoadOrdersIntoList
-End Sub
-
-Private Sub bttnOrdersNext_Click
-	If currentOrdersPage >= totalOrdersPages Then Return
-	currentOrdersPage = currentOrdersPage + 1
-	LoadOrdersIntoList
-End Sub
-
-Private Sub CopyOrder(sourceOrderID As Int)
-	Try
-		Dim rsOrder As ResultSet = Main.SQLProducts.ExecQuery2( _
-			"SELECT * FROM orders WHERE order_id = ?", _
-			Array As String(sourceOrderID))
-		If rsOrder.RowCount = 0 Then
-			rsOrder.Close
-			ToastMessageShow("Order not found.", False)
-			Return
-		End If
-		rsOrder.Position = 0
-		Main.SELECTED_CUSTOMER_ID = rsOrder.GetInt("customer_id")
-		Main.SELECTED_CUSTOMER_CODE = rsOrder.GetString("customer_code")
-		Main.SELECTED_CUSTOMER_NAME = rsOrder.GetString("customer_name")
-		Main.SELECTED_CUSTOMER_OWNER = rsOrder.GetString("customer_owner")
-		Main.SELECTED_CUSTOMER_ADDRESS = rsOrder.GetString("customer_address")
-		Main.COPY_ORDER_SOURCE_ID = sourceOrderID
-		rsOrder.Close
-
-		' Redirect to customer selection screen first to confirm/modify customer before copying items
-		ToastMessageShow("Review customer details to confirm.", False)
-		StartActivity(customerSelection)
-	Catch
-		Log("CopyOrder error: " & LastException.Message)
-		ToastMessageShow("Could not copy order.", True)
-	End Try
-End Sub
-
-Private Sub DeleteOrder(orderID As Int)
-	Msgbox2Async("Cancel Order #" & orderID & "?", "Confirm Cancel", "Yes, Cancel", "No", "", Null, False)
+	Msgbox2Async("Delete this order from the local list?", "Confirm Delete", "Delete", "", "Cancel", Null, False)
 	Wait For Msgbox_Result (Result As Int)
 	If Result <> DialogResponse.POSITIVE Then Return
 
 	Try
 		Main.SQLProducts.ExecNonQuery2("UPDATE orders SET sync_status = 'Cancelled' WHERE order_id = ?", Array As Object(orderID))
-		Main.SQLProducts.ExecNonQuery2("UPDATE order_items SET fulfillment_status = 'Cancelled' WHERE order_id = ?", Array As Object(orderID))
-		ToastMessageShow("Order #" & orderID & " cancelled.", False)
+		ToastMessageShow("Order removed from the list.", False)
 		LoadOrdersIntoList
+		LoadHistoryIntoCustomListView
 		UpdateDashboardStatusLabels
 	Catch
-		Log("DeleteOrder error: " & LastException.Message)
-		ToastMessageShow("Could not cancel order.", True)
+		Log("bttnDeleteOrder_Click error: " & LastException.Message)
+		ToastMessageShow("Unable to delete order.", True)
 	End Try
 End Sub
 
-Private Sub ShowOrderDetails(orderID As Int)
-	Try
-		Dim cursorOrder As Cursor = Main.SQLProducts.ExecQuery2( _
-	            "SELECT order_id, transaction_number, date_created, total_amount, status, sync_status, customer_id, customer_name, customer_owner, customer_address, is_paid, is_received, is_booked " & _
-	            "FROM orders WHERE order_id = ?", _
-	            Array As String(orderID))
+Private Sub GetOrderIdFromSender(senderObject As Object) As Int
+	Dim viewSender As View = senderObject
+	If viewSender.IsInitialized = False Then Return 0
+	If IsNumber(viewSender.Tag) = False Then Return 0
+	Return viewSender.Tag
+End Sub
 
+' ======================
+' INVENTORY TAB
+' ======================
+
+Private Sub LoadInventoryItemsIntoCLV
+	EnsureLocalSchema
+
+	If clvInventory.IsInitialized = False Then
+		Log("LoadInventoryItemsIntoCLV skipped: clvInventory not initialized")
+		Return
+	End If
+
+	clvInventory.Clear
+	clvInventory.Add(CreateRequestStocksRow, "request")
+
+	Dim rs As ResultSet = Main.SQLProducts.ExecQuery2( _
+        "SELECT * FROM items WHERE is_active = 1 AND vendor_id = ? ORDER BY item_name", _
+        Array As String(Main.VENDOR_ID))
+
+	If rs.RowCount = 0 Then
+		rs.Close
+		ShowEmptyInventoryMessage
+		Return
+	End If
+
+	Do While rs.NextRow
+		Dim itemId As Int = rs.GetInt("item_id")
+		Dim itemName As String = rs.GetString("item_name")
+		Dim itemCode As String = rs.GetString("item_code")
+		Dim unitPrice As Double = rs.GetDouble("unit_price")
+
+		Dim assignedStock As Int = 0
+		If HasColumnValue(rs, "assigned_stock") Then assignedStock = rs.GetInt("assigned_stock")
+
+		Dim usedStock As Int = 0
+		If HasColumnValue(rs, "used_stock") Then usedStock = rs.GetInt("used_stock")
+
+		Dim remainingStock As Int = 0
+		If HasColumnValue(rs, "remaining_stock") Then
+			remainingStock = rs.GetInt("remaining_stock")
+		Else
+			remainingStock = assignedStock - usedStock
+			If remainingStock < 0 Then remainingStock = 0
+		End If
+
+		clvInventory.Add(CreateInventoryRow(itemName, itemCode, unitPrice, assignedStock, usedStock, remainingStock), itemId)
+	Loop
+	rs.Close
+End Sub
+
+Private Sub clvInventory_ItemClick(Index As Int, Value As Object)
+	If Value Is String Then
+		If Value = "request" Then
+			StartActivity(StockRequest)
+		End If
+	End If
+End Sub
+
+Private Sub CreateRequestStocksRow As Panel
+	Dim pnl As Panel
+	pnl.Initialize("")
+	pnl.Color = Colors.RGB(247, 250, 255)
+	pnl.SetLayout(0, 0, clvInventory.AsView.Width, 66dip)
+
+	Dim accent As Panel
+	accent.Initialize("")
+	accent.Color = Colors.RGB(33, 150, 243)
+	pnl.AddView(accent, 10dip, 12dip, 4dip, 42dip)
+
+	Dim lblTitle As Label
+	lblTitle.Initialize("")
+	lblTitle.Text = "Request Stocks"
+	lblTitle.TextSize = 17
+	lblTitle.TextColor = Colors.RGB(25, 55, 95)
+	lblTitle.Typeface = Typeface.DEFAULT_BOLD
+	pnl.AddView(lblTitle, 24dip, 12dip, clvInventory.AsView.Width - 50dip, 24dip)
+
+	Dim lblSubtitle As Label
+	lblSubtitle.Initialize("")
+	lblSubtitle.Text = "Tap to open the request screen"
+	lblSubtitle.TextSize = 12
+	lblSubtitle.TextColor = Colors.RGB(96, 125, 139)
+	pnl.AddView(lblSubtitle, 24dip, 34dip, clvInventory.AsView.Width - 50dip, 16dip)
+
+	Dim lblChevron As Label
+	lblChevron.Initialize("")
+	lblChevron.Text = Chr(0x203A)
+	lblChevron.TextSize = 26
+	lblChevron.Typeface = Typeface.DEFAULT_BOLD
+	lblChevron.TextColor = Colors.RGB(33, 150, 243)
+	lblChevron.Gravity = Gravity.CENTER
+	pnl.AddView(lblChevron, clvInventory.AsView.Width - 40dip, 14dip, 28dip, 30dip)
+
+	Return pnl
+End Sub
+
+Private Sub CreateInventoryRow(itemName As String, itemCode As String, unitPrice As Double, assignedStock As Int, usedStock As Int, remainingStock As Int) As Panel
+	Dim pnl As Panel
+	pnl.Initialize("")
+	pnl.Color = Colors.White
+	pnl.SetLayout(0, 0, clvInventory.AsView.Width, 96dip)
+
+	Dim lblName As Label
+	lblName.Initialize("")
+	lblName.Text = itemName
+	lblName.TextSize = 16
+	lblName.TextColor = Colors.Black
+	lblName.Typeface = Typeface.DEFAULT_BOLD
+	pnl.AddView(lblName, 12dip, 8dip, clvInventory.AsView.Width - 120dip, 22dip)
+
+	Dim lblPrice As Label
+	lblPrice.Initialize("")
+	lblPrice.Text = "₱" & NumberFormat2(unitPrice, 1, 2, 2, False)
+	lblPrice.TextSize = 14
+	lblPrice.TextColor = Colors.RGB(0, 120, 0)
+	pnl.AddView(lblPrice, 12dip, 32dip, clvInventory.AsView.Width - 120dip, 20dip)
+
+	Dim lblCode As Label
+	lblCode.Initialize("")
+	lblCode.Text = "Code: " & itemCode
+	lblCode.TextSize = 12
+	lblCode.TextColor = Colors.Gray
+	pnl.AddView(lblCode, 12dip, 52dip, clvInventory.AsView.Width - 120dip, 16dip)
+
+	Dim stockPanel As Panel
+	stockPanel.Initialize("")
+	stockPanel.Color = GetStockColor(remainingStock, assignedStock)
+	pnl.AddView(stockPanel, clvInventory.AsView.Width - 92dip, 14dip, 80dip, 68dip)
+
+	Dim lblStockTitle As Label
+	lblStockTitle.Initialize("")
+	lblStockTitle.Text = "Left"
+	lblStockTitle.TextSize = 11
+	lblStockTitle.TextColor = Colors.White
+	lblStockTitle.Gravity = Gravity.CENTER
+	stockPanel.AddView(lblStockTitle, 0, 6dip, stockPanel.Width, 16dip)
+
+	Dim lblStockValue As Label
+	lblStockValue.Initialize("")
+	lblStockValue.Text = "" & remainingStock
+	lblStockValue.TextSize = 20
+	lblStockValue.TextColor = Colors.White
+	lblStockValue.Typeface = Typeface.DEFAULT_BOLD
+	lblStockValue.Gravity = Gravity.CENTER
+	stockPanel.AddView(lblStockValue, 0, 24dip, stockPanel.Width, 28dip)
+
+	Dim lblStockMeta As Label
+	lblStockMeta.Initialize("")
+	lblStockMeta.Text = "Used " & usedStock
+	lblStockMeta.TextSize = 10
+	lblStockMeta.TextColor = Colors.White
+	lblStockMeta.Gravity = Gravity.CENTER
+	stockPanel.AddView(lblStockMeta, 0, 50dip, stockPanel.Width, 14dip)
+
+	Dim pnlSep As Panel
+	pnlSep.Initialize("")
+	pnlSep.Color = Colors.RGB(235, 235, 235)
+	pnl.AddView(pnlSep, 12dip, 92dip, clvInventory.AsView.Width - 24dip, 1dip)
+
+	Return pnl
+End Sub
+
+Private Sub ShowEmptyInventoryMessage
+	If clvInventory.IsInitialized = False Then Return
+
+	Dim pnlEmpty As Panel
+	pnlEmpty.Initialize("")
+	pnlEmpty.Color = Colors.Transparent
+	pnlEmpty.SetLayout(0, 0, clvInventory.AsView.Width, 78dip)
+
+	Dim lblEmpty As Label
+	lblEmpty.Initialize("")
+	lblEmpty.Text = "No products cached. Go to Dashboard and sync first."
+	lblEmpty.TextSize = 14
+	lblEmpty.TextColor = Colors.Gray
+	lblEmpty.Gravity = Gravity.CENTER
+	pnlEmpty.AddView(lblEmpty, 0, 18dip, clvInventory.AsView.Width, 32dip)
+
+	clvInventory.Add(pnlEmpty, "empty")
+End Sub
+
+Private Sub ShowOrderDetails(orderID As Int)
+	Dim cursorOrder As Cursor
+	Dim cursorItems As Cursor
+	Try
+		cursorOrder = Main.SQLProducts.ExecQuery2("SELECT * FROM orders WHERE order_id = ?", Array As String(orderID))
 		If cursorOrder.RowCount = 0 Then
-			ToastMessageShow("Order not found", False)
 			cursorOrder.Close
+			ToastMessageShow("Order not found.", False)
 			Return
 		End If
 
 		cursorOrder.Position = 0
 
 		Dim transactionNumber As String = ""
-		Try
+		If HasColumn("orders", "transaction_number") Then
 			transactionNumber = cursorOrder.GetString("transaction_number")
 			If transactionNumber = Null Then transactionNumber = ""
-		Catch
-			transactionNumber = ""
-		End Try
+		End If
 
 		Dim orderDate As Long = 0
-		Try
-			orderDate = cursorOrder.GetLong("date_created")
-		Catch
-			orderDate = 0
-		End Try
+		If HasColumn("orders", "date_created") Then orderDate = cursorOrder.GetLong("date_created")
+
 		Dim totalAmount As Double = 0
-		Try
-			totalAmount = cursorOrder.GetDouble("total_amount")
-		Catch
-			totalAmount = 0
-		End Try
+		If HasColumn("orders", "total_amount") Then totalAmount = cursorOrder.GetDouble("total_amount")
+
 		Dim orderStatus As String = ""
-		Try
+		If HasColumn("orders", "status") Then
 			orderStatus = cursorOrder.GetString("status")
 			If orderStatus = Null Then orderStatus = ""
-		Catch
-			orderStatus = ""
-		End Try
+		End If
 
 		Dim isPaid As Boolean = False
 		Dim isReceived As Boolean = False
 		Dim isBooked As Boolean = False
-		Try
-			If HasColumn("orders", "is_paid") Then
-				isPaid = cursorOrder.GetInt("is_paid") = 1
-				isReceived = cursorOrder.GetInt("is_received") = 1
-				isBooked = cursorOrder.GetInt("is_booked") = 1
-				orderStatus = BuildOrderStatusDisplay(isPaid, isReceived, isBooked)
-			Else
-				orderStatus = GetOrderDisplayStatus(orderID, orderStatus)
-			End If
-		Catch
+		If HasColumn("orders", "is_paid") Then
+			isPaid = cursorOrder.GetInt("is_paid") = 1
+			isReceived = cursorOrder.GetInt("is_received") = 1
+			isBooked = cursorOrder.GetInt("is_booked") = 1
+			orderStatus = BuildOrderStatusDisplay(isPaid, isReceived, isBooked)
+		Else
 			orderStatus = GetOrderDisplayStatus(orderID, orderStatus)
-		End Try
+		End If
 
-		' Try to read customer fields if present (EnsureLocalSchema adds them)
 		Dim customerName As String = ""
 		Dim customerOwner As String = ""
 		Dim customerAddress As String = ""
-		Try
-			If HasColumn("orders", "customer_name") Then
-				customerName = cursorOrder.GetString("customer_name")
-				If customerName = Null Then customerName = ""
-				customerOwner = cursorOrder.GetString("customer_owner")
-				If customerOwner = Null Then customerOwner = ""
-				customerAddress = cursorOrder.GetString("customer_address")
-				If customerAddress = Null Then customerAddress = ""
-			End If
-		Catch
-			customerName = ""
-			customerOwner = ""
-			customerAddress = ""
-		End Try
+		If HasColumn("orders", "customer_name") Then
+			customerName = cursorOrder.GetString("customer_name")
+			If customerName = Null Then customerName = ""
+			customerOwner = cursorOrder.GetString("customer_owner")
+			If customerOwner = Null Then customerOwner = ""
+			customerAddress = cursorOrder.GetString("customer_address")
+			If customerAddress = Null Then customerAddress = ""
+		End If
 
-		cursorOrder.Close
-
-		Dim cursorItems As Cursor = Main.SQLProducts.ExecQuery2( _
-            "SELECT oi.product_id, oi.quantity, oi.price, oi.fulfillment_status, i.item_name " & _
-            "FROM order_items oi " & _
-            "LEFT JOIN items i ON oi.product_id = i.item_id " & _
-            "WHERE oi.order_id = ?", _
-            Array As String(orderID))
+		cursorItems = Main.SQLProducts.ExecQuery2( _
+			"SELECT oi.product_id, oi.quantity, oi.price, i.item_name " & _
+			"FROM order_items oi " & _
+			"LEFT JOIN items i ON oi.product_id = i.item_id " & _
+			"WHERE oi.order_id = ?", _
+			Array As String(orderID))
 
 		Dim itemsText As String = ""
-
 		If cursorItems.RowCount = 0 Then
 			itemsText = "(No item lines found)"
 		Else
@@ -702,28 +828,22 @@ Private Sub ShowOrderDetails(orderID As Int)
 				cursorItems.Position = i
 
 				Dim itemName As String = cursorItems.GetString("item_name")
-				If itemName = Null Or itemName = "" Then
-					itemName = "Item #" & cursorItems.GetInt("product_id")
-				End If
+				If itemName = Null Or itemName = "" Then itemName = "Item #" & cursorItems.GetInt("product_id")
 
 				Dim quantity As Int = cursorItems.GetInt("quantity")
 				Dim price As Double = cursorItems.GetDouble("price")
 				Dim lineTotal As Double = price * quantity
 
-				itemsText = itemsText & _
-                    itemName & CRLF & _
-                    "₱" & NumberFormat2(price, 1, 2, 2, False) & " × (" & quantity & ") = ₱" & NumberFormat2(lineTotal, 1, 2, 2, False) & CRLF & CRLF
+				itemsText = itemsText & itemName & CRLF & _
+					"₱" & NumberFormat2(price, 1, 2, 2, False) & " × (" & quantity & ") = ₱" & NumberFormat2(lineTotal, 1, 2, 2, False) & CRLF & CRLF
 			Next
 		End If
-
-		cursorItems.Close
 
 		Dim paidLabel As String = IIf(isPaid, "✓ Paid", "✗ Unpaid")
 		Dim receivedLabel As String = IIf(isReceived, "✓ Received", "✗ Not Received")
 		Dim bookedLabel As String = IIf(isBooked, "✓ Booked", "✗ Not Booked")
 
-		Dim message As String = _
-			"Transaction: " & transactionNumber & CRLF & _
+		Dim message As String = "Transaction: " & transactionNumber & CRLF & _
 			(IIf(customerName <> "", "Customer: " & customerName & CRLF, "")) & _
 			(IIf(customerOwner <> "", "Owner: " & customerOwner & CRLF, "")) & _
 			(IIf(customerAddress <> "", "Address: " & customerAddress & CRLF, "")) & _
@@ -732,10 +852,14 @@ Private Sub ShowOrderDetails(orderID As Int)
 			"Total: ₱" & NumberFormat2(totalAmount, 1, 2, 2, False) & CRLF & CRLF & _
 			"Items:" & CRLF & itemsText
 
+		cursorOrder.Close
+		cursorItems.Close
+
 		Msgbox2Async(message, "Order #" & orderID, "OK", "", "", Null, False)
 		Wait For Msgbox_Result (Result As Int)
-
 	Catch
+		If cursorOrder.IsInitialized Then cursorOrder.Close
+		If cursorItems.IsInitialized Then cursorItems.Close
 		Log("ShowOrderDetails error: " & LastException.Message)
 		ToastMessageShow("Could not load order details. Please try again.", True)
 	End Try
@@ -776,6 +900,7 @@ Private Sub bttnFetchProducts_Click
 			ShowFetchErrorMessage("Server returned empty response")
 		Else
 			ParseAndSaveProductsFromServerResponse(response)
+			FetchAssignedStockForLocalCache
 		End If
 	Else
 		ShowFetchErrorMessage("Cannot connect. Check WiFi and server.")
@@ -839,6 +964,132 @@ Private Sub ParseAndSaveProductsFromServerResponse(response As String)
 	Catch
 		ShowFetchErrorMessage("Failed to read server response: " & LastException.Message)
 	End Try
+End Sub
+
+Private Sub FetchAssignedStockForLocalCache
+	If Main.LoggedInUserID <= 0 Or Main.LoggedInConventionID <= 0 Then Return
+
+	Dim stockJob As HttpJob
+	stockJob.Initialize("FetchAssignedStock", Me)
+	currentSyncJob = stockJob
+	Dim stockUrl As String = Main.API_URL & "API/get_order_taker_stock.php?convention_id=" & Main.LoggedInConventionID & _
+		"&user_id=" & Main.LoggedInUserID & _
+		"&limit=1000"
+	stockJob.Download(stockUrl)
+
+	Wait For (stockJob) JobDone(jobStock As HttpJob)
+	If jobStock.Success = False Then
+		Log("Assigned stock fetch failed: " & jobStock.ErrorMessage)
+	Else
+		Try
+			Dim parser As JSONParser
+			parser.Initialize(jobStock.GetString)
+			Dim root As Map = parser.NextObject
+			If root.Get("status") <> "success" Then
+				Log("Assigned stock fetch returned no success status")
+			Else
+				Dim rows As List = root.Get("data")
+				If rows.IsInitialized Then
+					Log("Assigned stock refresh returned " & rows.Size & " row(s)")
+					ApplyAssignedStockToLocalItems(rows)
+				End If
+			End If
+		Catch
+			Log("FetchAssignedStockForLocalCache error: " & LastException.Message)
+		End Try
+	End If
+
+	LoadInventoryItemsIntoCLV
+
+	jobStock.Release
+	currentSyncJob = Null
+End Sub
+
+Private Sub ApplyAssignedStockToLocalItems(rows As List)
+	If rows.IsInitialized = False Or rows.Size = 0 Then Return
+
+	Dim pendingUsage As Map = GetPendingLocalStockUsageMap
+
+	Try
+		Main.SQLProducts.ExecNonQuery("BEGIN TRANSACTION")
+		For Each stockRow As Map In rows
+			Dim itemId As Int = 0
+			If stockRow.ContainsKey("item_id") And stockRow.Get("item_id") <> Null Then
+				itemId = stockRow.Get("item_id")
+			End If
+			If itemId <= 0 Then Continue
+
+			Dim assignedStock As Int = 0
+			If stockRow.ContainsKey("assigned_stock") And stockRow.Get("assigned_stock") <> Null Then
+				assignedStock = stockRow.Get("assigned_stock")
+			End If
+
+			Dim usedStock As Int = 0
+			If stockRow.ContainsKey("used_stock") And stockRow.Get("used_stock") <> Null Then
+				usedStock = stockRow.Get("used_stock")
+			End If
+
+			Dim pendingUsed As Int = 0
+			If pendingUsage.IsInitialized And pendingUsage.ContainsKey(itemId) Then
+				pendingUsed = pendingUsage.Get(itemId)
+			End If
+
+			Dim remainingStock As Int = 0
+			If stockRow.ContainsKey("remaining_stock") And stockRow.Get("remaining_stock") <> Null Then
+				remainingStock = stockRow.Get("remaining_stock")
+			Else
+				remainingStock = assignedStock - usedStock
+			End If
+
+			If pendingUsed > 0 Then
+				usedStock = usedStock + pendingUsed
+				remainingStock = remainingStock - pendingUsed
+			End If
+
+			If remainingStock < 0 Then remainingStock = 0
+
+			Main.SQLProducts.ExecNonQuery2( _
+				"UPDATE items SET assigned_stock = ?, used_stock = ?, remaining_stock = ? WHERE item_id = ?", _
+				Array As Object(assignedStock, usedStock, remainingStock, itemId))
+			Log("Stock cache updated for item_id=" & itemId & ": assigned=" & assignedStock & ", used=" & usedStock & ", remaining=" & remainingStock)
+		Next
+		Main.SQLProducts.ExecNonQuery("COMMIT")
+	Catch
+		Try
+			Main.SQLProducts.ExecNonQuery("ROLLBACK")
+		Catch
+			Log(LastException.Message)
+		End Try
+		Log("ApplyAssignedStockToLocalItems error: " & LastException.Message)
+	End Try
+End Sub
+
+Private Sub GetPendingLocalStockUsageMap As Map
+	Dim pendingUsage As Map
+	pendingUsage.Initialize
+
+	If Main.SQLProducts.IsInitialized = False Then Return pendingUsage
+
+	Dim rs As ResultSet
+	Try
+		rs = Main.SQLProducts.ExecQuery2( _
+			"SELECT oi.product_id, IFNULL(SUM(oi.quantity), 0) AS pending_qty " & _
+			"FROM orders o " & _
+			"INNER JOIN order_items oi ON oi.order_id = o.order_id " & _
+			"WHERE o.vendor_id = ? AND o.user_id = ? AND IFNULL(o.sync_status, '') NOT IN ('Synced', 'Cancelled') " & _
+			"GROUP BY oi.product_id", _
+			Array As String(Main.VENDOR_ID, Main.LoggedInUserID))
+
+		Do While rs.NextRow
+			pendingUsage.Put(rs.GetInt("product_id"), rs.GetInt("pending_qty"))
+		Loop
+		rs.Close
+	Catch
+		If rs.IsInitialized Then rs.Close
+		Log("GetPendingLocalStockUsageMap error: " & LastException.Message)
+	End Try
+
+	Return pendingUsage
 End Sub
 
 Private Sub DeleteOldCacheAndSaveFreshProducts(items As List)
@@ -1299,6 +1550,7 @@ Private Sub SyncNextPendingOrder
 				syncOrdersCompletedCount = syncOrdersCompletedCount + 1
 				LoadOrdersIntoList
 				LoadHistoryIntoCustomListView
+				FetchAssignedStockForLocalCache
 				UpdateDashboardStatusLabels
 				DrawWeeklySalesChart
 				DrawOrderStatusPieChart
@@ -1512,69 +1764,20 @@ End Sub
 ' INVENTORY TAB
 ' ======================
 
-Private Sub LoadInventoryItemsIntoScrollView
-	svInventory.Panel.RemoveAllViews
-	Dim top As Int = 0
-
-	Dim rs As ResultSet = Main.SQLProducts.ExecQuery2( _
-        "SELECT * FROM items WHERE is_active = 1 AND vendor_id = ? ORDER BY item_name", _
-        Array As String(Main.VENDOR_ID))
-
-	If rs.RowCount = 0 Then
-		ShowEmptyInventoryMessage
-		rs.Close
-		Return
-	End If
-
-	Do While rs.NextRow
-		Dim pnl As Panel
-		pnl.Initialize("")
-		pnl.Color = Colors.White
-
-		Dim lblName As Label
-		lblName.Initialize("")
-		lblName.Text = rs.GetString("item_name")
-		lblName.TextSize = 16
-		lblName.TextColor = Colors.Black
-
-		Dim lblPrice As Label
-		lblPrice.Initialize("")
-		lblPrice.Text = "₱" & NumberFormat2(rs.GetDouble("unit_price"), 1, 2, 2, False)
-		lblPrice.TextSize = 14
-		lblPrice.TextColor = Colors.RGB(0, 120, 0)
-
-		Dim lblCode As Label
-		lblCode.Initialize("")
-		lblCode.Text = "Code: " & rs.GetString("item_code")
-		lblCode.TextSize = 12
-		lblCode.TextColor = Colors.Gray
-
-		pnl.AddView(lblName, 10dip, 5dip, svInventory.Width - 20dip, 25dip)
-		pnl.AddView(lblPrice, 10dip, 30dip, svInventory.Width - 20dip, 20dip)
-		pnl.AddView(lblCode, 10dip, 50dip, svInventory.Width - 20dip, 15dip)
-
-		svInventory.Panel.AddView(pnl, 0, top, svInventory.Width, 75dip)
-		top = top + 76dip
-
-		Dim pnlSep As Panel
-		pnlSep.Initialize("")
-		pnlSep.Color = Colors.RGB(230, 230, 230)
-		svInventory.Panel.AddView(pnlSep, 10dip, top, svInventory.Width - 20dip, 1dip)
-		top = top + 5dip
-	Loop
-	rs.Close
-
-	svInventory.Panel.Height = top
+Private Sub GetStockColor(remainingStock As Int, assignedStock As Int) As Int
+	If assignedStock <= 0 Then Return Colors.Gray
+	If remainingStock <= 0 Then Return Colors.RGB(198, 40, 40)
+	If remainingStock <= 5 Then Return Colors.RGB(230, 126, 34)
+	Return Colors.RGB(46, 125, 50)
 End Sub
 
-Private Sub ShowEmptyInventoryMessage
-	Dim lblEmpty As Label
-	lblEmpty.Initialize("")
-	lblEmpty.Text = "No products cached. Go to Dashboard and sync first."
-	lblEmpty.TextSize = 14
-	lblEmpty.TextColor = Colors.Gray
-	lblEmpty.Gravity = Gravity.CENTER
-	svInventory.Panel.AddView(lblEmpty, 0, 20dip, svInventory.Width, 40dip)
+Private Sub HasColumnValue(rs As ResultSet, columnName As String) As Boolean
+	Try
+		rs.GetString(columnName)
+		Return True
+	Catch
+		Return False
+	End Try
 End Sub
 
 ' ======================

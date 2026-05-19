@@ -13,6 +13,7 @@ Sub Process_Globals
 End Sub
 
 Sub Globals
+	Private pnlroot As Panel
 	Private lblBack As Label
 	Private lblTitle As Label
 	Private lblSubtitle As Label
@@ -25,6 +26,10 @@ End Sub
 
 Sub Activity_Create(FirstTime As Boolean)
 	Activity.LoadLayout("supervisorsyncedorders")
+	If Main.LoggedInUserID <= 0 Then
+		Activity.Finish
+		Return
+	End If
 	If lblSubtitle.IsInitialized Then
 		lblSubtitle.Text = "Viewing: " & Main.SelectedOrderTakerFullName & " (@" & Main.SelectedOrderTakerLoginName & ")"
 	End If
@@ -42,6 +47,10 @@ Sub Activity_Create(FirstTime As Boolean)
 End Sub
 
 Sub Activity_Resume
+	If Main.LoggedInUserID <= 0 Then
+		Activity.Finish
+		Return
+	End If
 	If ordersRows.IsInitialized = False Or ordersRows.Size = 0 Then
 		LoadSyncedOrders
 	End If
@@ -227,6 +236,15 @@ End Sub
 
 Private Sub lblRefresh_Click
 	LoadSyncedOrders
+End Sub
+
+Private Sub btnStock_Click
+	If Main.SelectedOrderTakerUserID <= 0 Then
+		ToastMessageShow("Select an order taker first.", True)
+		Return
+	End If
+	StartActivity(SupervisorStockAssignment)
+	Activity.Finish
 End Sub
 
 Private Sub lblBack_Click

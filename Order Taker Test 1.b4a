@@ -1,14 +1,20 @@
 ﻿Build1=Default,b4a.OrderTakerTest1
 File1=addOrderActivity.bal
+File10=SupervisorStockAssignment.bal
+File11=SupervisorStockRequestQueue.bal
+File12=supervisorsyncedorders.bal
 File2=bggg.jpg
 File3=customerSelection.bal
 File4=forgotPass.bal
 File5=loginTest1.db
 File6=main.bal
 File7=OrderTakerDashboard.bal
-File8=SupervisorOrderTakerSelection.bal
-File9=supervisorsyncedorders.bal
+File8=StockRequest.bal
+File9=SupervisorOrderTakerSelection.bal
 FileGroup1=Default Group
+FileGroup10=Default Group
+FileGroup11=Default Group
+FileGroup12=Default Group
 FileGroup2=Default Group
 FileGroup3=Default Group
 FileGroup4=Default Group
@@ -28,16 +34,19 @@ Library7=xui
 Library8=xui views
 ManifestCode='This code will be applied to the manifest file during compilation.~\n~'You do not need to modify it in most cases.~\n~'See this link for for more information: https://www.b4x.com/forum/showthread.php?p=78136~\n~AddManifestText(~\n~<uses-sdk android:minSdkVersion="21" android:targetSdkVersion="35"/>~\n~<supports-screens android:largeScreens="true" ~\n~    android:normalScreens="true" ~\n~    android:smallScreens="true" ~\n~    android:anyDensity="true"/>)~\n~SetApplicationAttribute(android:icon, "@drawable/icon")~\n~SetApplicationAttribute(android:label, "$LABEL$")~\n~CreateResourceFromFile(Macro, Themes.LightTheme)~\n~SetApplicationAttribute(android:usesCleartextTraffic, "true")~\n~AddPermission(android.permission.INTERNET)~\n~AddPermission(android.permission.ACCESS_NETWORK_STATE)~\n~'End of default text.~\n~
 Module1=addOrderActivity
+Module10=SupervisorStockRequestQueue
+Module11=SupervisorSyncedOrders
 Module2=Charts
 Module3=customerSelection
 Module4=forgotPass
 Module5=OrderTakerDashboard
 Module6=Starter
-Module7=SupervisorOrderTakerSelection
-Module8=SupervisorSyncedOrders
-NumberOfFiles=9
+Module7=StockRequest
+Module8=SupervisorOrderTakerSelection
+Module9=SupervisorStockAssignment
+NumberOfFiles=12
 NumberOfLibraries=8
-NumberOfModules=8
+NumberOfModules=11
 Version=13.4
 @EndOfDesignText@
 #Region  Project Attributes 
@@ -87,7 +96,7 @@ Sub Process_Globals
 	Public COPY_ORDER_SOURCE_ID As Int = 0
 
 	' API base URL (important: base path only, not specific endpoint)
-	Public API_URL As String = "http://192.168.8.225/ordertaker_api/"
+	Public API_URL As String = "http://192.168.8.224/ordertaker_api/"
 	Public ITEMS_LAST_SYNC As Long = 0
 
 	Private xui As XUI
@@ -120,6 +129,34 @@ Sub Activity_Resume
 End Sub
 
 Sub Activity_Pause(UserClosed As Boolean)
+End Sub
+
+Public Sub ResetSessionForLogout
+	LoggedInUser = ""
+	LoggedInUserID = 0
+	LoggedInUserFullName = ""
+	LoggedInGroupID = 0
+	LoggedInRequiresVendorSelection = False
+	VENDOR_ID = 0
+	AssignedVendors.Initialize
+
+	SelectedOrderTakerUserID = 0
+	SelectedOrderTakerLoginName = ""
+	SelectedOrderTakerFullName = ""
+	SelectedOrderTakerGroupID = 0
+	SelectedOrderTakerVendorID = 0
+	SelectedOrderTakerRequiresVendorSelection = False
+	SelectedOrderTakerAssignedVendors.Initialize
+
+	SELECTED_CUSTOMER_ID = 0
+	SELECTED_CUSTOMER_CODE = ""
+	SELECTED_CUSTOMER_NAME = ""
+	SELECTED_CUSTOMER_OWNER = ""
+	SELECTED_CUSTOMER_ADDRESS = ""
+	COPY_ORDER_SOURCE_ID = 0
+
+	If etuser.IsInitialized Then etuser.Text = ""
+	If etpassword.IsInitialized Then etpassword.Text = ""
 End Sub
 
 ' Gets the unique Android device ID and stores it in DEVICE_ID
@@ -156,7 +193,10 @@ Private Sub SetupProductsDatabase
         "unit_price REAL, " & _
         "barcode TEXT, " & _
         "vendor_id INTEGER, " & _
-        "is_active INTEGER)")
+	    "is_active INTEGER, " & _
+	    "assigned_stock INTEGER DEFAULT 0, " & _
+	    "used_stock INTEGER DEFAULT 0, " & _
+	    "remaining_stock INTEGER DEFAULT 0)")
 	
 	' Customers table for offline selection (cached via Fetch)
 	SQLProducts.ExecNonQuery("CREATE TABLE IF NOT EXISTS mst_customers (" & _
